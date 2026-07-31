@@ -1,6 +1,7 @@
 import axios, { type AxiosInstance, type InternalAxiosRequestConfig, type AxiosResponse } from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useUserStore } from '@/store/user'
+import { formatValidationDetail, safeMessage } from '@/utils/errorFormat'
 
 /**
  * Wings 3.0 Axios Interceptor Gateway
@@ -40,7 +41,9 @@ service.interceptors.request.use(
  *
  * 401 → clear auth + redirect to /login
  * 403 → multi-tenant violation alert (ElMessageBox)
- * 500 → server error toast (ElMessage)
+ * 422 → 字段级可读校验错误（数组 detail 格式化，不再 [object Object]）
+ * 500 → 通用文案，不展示内部对象（避免泄露 SQL / 路径 / 服务细节）
+ * 其他 → 字符串原样（截断），非字符串给通用文案
  */
 service.interceptors.response.use(
   (response: AxiosResponse) => {
@@ -56,7 +59,7 @@ service.interceptors.response.use(
     }
 
     const status = response.status
-    const detail = response.data?.detail || response.data?.message || '未知错误'
+    const rawDetail = response.data?.detail ?? response.data?.message
 
     switch (status) {
       case 401:
@@ -70,7 +73,7 @@ service.interceptors.response.use(
       case 403:
         // Multi-tenant isolation violation — show alert box
         ElMessageBox.alert(
-          `多租户隔离拦截：${detail}`,
+          `多租户隔离拦截：${safeMessage(rawDetail)}`,
           '访问被拒绝',
           {
             confirmButtonText: '我知道了',
@@ -80,42 +83,69 @@ service.interceptors.response.use(
         break
 
       case 404:
-        ElMessage.error(`资源不存在：${detail}`)
+        ElMessage.error(`资源不存在：${safeMessage(rawDetail)}`)
         break
 
       case 422:
-        // Validation error — show field-level errors
-        ElMessage.error(`参数校验失败：${detail}`)
+        // Validation error — show field-level readable errors (no [object Object])
+        ElMessage.error(`参数校验失败：${formatValidationDetail(rawDetail)}`)
         break
 
       case 500:
-        ElMessage.error(`服务器内部错误：${detail}`)
-        console.error('[Server 500]', response.data)
+        // 不展示内部错误对象，避免泄露 SQL / 路径 / 服务细节
+        ElMessage.error('服务器内部错误，请稍后重试')
+        console.error('[Server 500]', status)
         break
 
       default:
-        ElMessage.error(`请求失败 (${status})：${detail}`)
+        ElMessage.error(safeMessage(rawDetail))
     }
 
     return Promise.reject(error)
   }
 )
 
-export default service
-
 // ═══════════════════════════════════════════════════════════════
-// Type-level override: the response interceptor (line 47) unpacks
-// AxiosResponse → response.data at runtime.  This augmentation
-// tells TypeScript that get/post/put/delete return Promise<T>
+// Type-level override: the response interceptor (above) unpacks
+// AxiosResponse → response.data at runtime.  We re-export a
+// typed wrapper so that get/post/put/delete return Promise<R>
 // directly — matching actual runtime behavior across every API
 // caller in the project.
+//
+// BUILD-GATE-001: replaced `declare module 'axios'` augmentation
+// (which was not being resolved by vue-tsc) with a precise type
+// definition that supports the dual-generic <T, R> calling pattern
+// used throughout the API layer.  No runtime behavior change.
 // ═══════════════════════════════════════════════════════════════
-declare module 'axios' {
-  interface AxiosInstance {
-    get<T = any>(url: string, config?: any): Promise<T>
-    post<T = any>(url: string, data?: any, config?: any): Promise<T>
-    put<T = any>(url: string, data?: any, config?: any): Promise<T>
-    delete<T = any>(url: string, config?: any): Promise<T>
-    patch<T = any>(url: string, data?: any, config?: any): Promise<T>
-  }
+
+/**
+ * UnwrappedAxiosInstance — precise type for the axios instance
+ * after the response interceptor strips the AxiosResponse wrapper.
+ *
+ * Dual-generic methods <T, R = T>:
+ *   T = response body shape (for documentation)
+ *   R = actual return type (defaults to T, matching interceptor behavior)
+ *
+ * This mirrors the original `declare module 'axios'` augmentation
+ * that was not resolved by vue-tsc.
+ */
+interface UnwrappedAxiosInstance {
+  <T = any, R = T>(config: any): Promise<R>
+  get<T = any, R = T>(url: string, config?: any): Promise<R>
+  delete<T = any, R = T>(url: string, config?: any): Promise<R>
+  head<T = any, R = T>(url: string, config?: any): Promise<R>
+  post<T = any, R = T>(url: string, data?: any, config?: any): Promise<R>
+  put<T = any, R = T>(url: string, data?: any, config?: any): Promise<R>
+  patch<T = any, R = T>(url: string, data?: any, config?: any): Promise<R>
+  interceptors: AxiosInstance['interceptors']
+  defaults: AxiosInstance['defaults']
 }
+
+/**
+ * The runtime axios instance with interceptor-applied type override.
+ * service already returns response.data via the response interceptor,
+ * so we safely narrow the type from AxiosInstance to UnwrappedAxiosInstance.
+ */
+const request: UnwrappedAxiosInstance = service as unknown as UnwrappedAxiosInstance
+
+export default request
