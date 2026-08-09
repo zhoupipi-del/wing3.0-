@@ -2,7 +2,9 @@ import request from './request'
 
 /**
  * Classes API
- * Maps to backend: /api/v1/classes/
+ * Maps to backend:
+ *   - class_mgmt: /api/v1/class_mgmt/classes/*
+ *   - student_registry: /api/v1/student_registry/students
  */
 
 export function getClasses(params?: {
@@ -10,18 +12,18 @@ export function getClasses(params?: {
   page?: number
   page_size?: number
 }) {
-  return request.get('/classes/', { params })
+  return request.get('/class_mgmt/classes/', { params })
 }
 
 export function getClassDetail(classId: number) {
-  return request.get(`/classes/${classId}`)
+  return request.get(`/class_mgmt/classes/${classId}`)
 }
 
 export function getClassStudents(classId: number, params?: {
   page?: number
   page_size?: number
 }) {
-  return request.get(`/classes/${classId}/students`, { params })
+  return request.get(`/class_mgmt/classes/${classId}/students`, { params })
 }
 
 /** Fetch grades list (年级) */
@@ -36,5 +38,5 @@ export function getStudents(params?: {
   page?: number
   page_size?: number
 }) {
-  return request.get('/students/', { params })
+  return request.get('/student_registry/students', { params })
 }
