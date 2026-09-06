@@ -62,13 +62,14 @@ service.interceptors.response.use(
     const rawDetail = response.data?.detail ?? response.data?.message
 
     switch (status) {
-      case 401:
+      case 401: {
         // Token expired or invalid — clear auth and redirect
         ElMessage.error('登录已过期，请重新登录')
         const userStore = useUserStore()
         userStore.clearAuth()
         window.location.href = import.meta.env.BASE_URL + 'login'
         break
+      }
 
       case 403:
         // Multi-tenant isolation violation — show alert box

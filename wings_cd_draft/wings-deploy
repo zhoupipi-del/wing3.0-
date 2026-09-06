@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+#
+# /usr/local/sbin/wings-deploy — WINGS 受限部署执行器（staging）
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# CI-STABILIZATION-R2 修复要点（Runner 权限架构）
+#   1. 绝不在 GitHub Runner workspace ($GITHUB_WORKSPACE / _work) 内以 root 执行
+#      npm ci / npm run build。这会把 root-owned 的 node_modules 写进 _work，
+#      导致下次 actions/checkout（以 wings-runner 身份）无法清理 → EACCES。
+#   2. 若 workflow 已先行构建好前端 dist（设 WINGS_DEPLOY_SKIP_BUILD=1），则直接消费，
+#      不在任何位置重复构建。
+#   3. 否则把源码复制到独立 release 目录，在 release 目录内构建——绝不碰 _work。
+#   4. 只读 origin/develop 引用做 SHA 自验，不持 production.env，不触 production。
+#
+# ⚠️ 部署路径变量（RELEASE_ROOT / CURRENT_LINK / SERVICE / HEALTHZ）必须与真实服务器对齐，
+#    安装前请按实际部署结构核对后再用。
+# ─────────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+ENV="${1:-staging}"
+SHA="${2:-}"
+WORKSPACE="${3:-${GITHUB_WORKSPACE:-}}"
+[ -n "$WORKSPACE" ] || die "workspace not given and GITHUB_WORKSPACE unset"
+
+# ── 可配置项（按需对齐真实服务器）──
+RELEASE_ROOT="/opt/wings3/releases"
+CURRENT_LINK="/opt/wings3/current"
+SERVICE="wings3-staging"            # systemd 单元名
+HEALTHZ="http://127.0.0.1:8091/s3-healthz"
+LOG_TAG="wings-deploy"
+
+log() { echo "[$LOG_TAG] $*"; }
+die() { echo "[$LOG_TAG][ERR] $*" >&2; exit 1; }
+
+[ "$(id -u)" -eq 0 ] || die "must run via sudo"
+[ -n "$SHA" ] || die "usage: wings-deploy <env> <sha> <workspace>"
+[ -d "$WORKSPACE" ] || die "workspace not found: $WORKSPACE"
+
+# SHA 自验：必须属于 origin/develop
+git -C "$WORKSPACE" fetch origin develop >/dev/null 2>&1 || true
+git -C "$WORKSPACE" cat-file -e "origin/develop" 2>/dev/null || die "cannot resolve origin/develop"
+[ "$(git -C "$WORKSPACE" rev-parse "$SHA" 2>/dev/null)" = "$(git -C "$WORKSPACE" rev-parse "origin/develop" 2>/dev/null)" ] \
+  || die "SHA $SHA 不属于 origin/develop，拒绝部署"
+
+TS="$(date +%Y%m%d-%H%M%S)"
+RELEASE_DIR="$RELEASE_ROOT/$TS-$SHA"
+log "preparing release dir: $RELEASE_DIR"
+install -d -o root -g root -m 755 "$RELEASE_DIR"
+
+# 复制源码到 release 目录（在 _work 之外操作，绝不在 _work 内构建）
+log "copying workspace -> $RELEASE_DIR (排除 node_modules/.git/dist)"
+rsync -a --delete \
+  --exclude=node_modules --exclude=.git --exclude=dist \
+  "$WORKSPACE/" "$RELEASE_DIR/"
+
+if [ "${WINGS_DEPLOY_SKIP_BUILD:-0}" = "1" ]; then
+  # fail-closed：声明了 SKIP_BUILD 却拿不到预构建产物，必须显式失败，不静默上线空目录
+  [ -d "$WORKSPACE/frontend/dist" ] \
+    || die "SKIP_BUILD=1 但 $WORKSPACE/frontend/dist 不存在：workflow 未产出构件，拒绝部署"
+  log "SKIP_BUILD=1：直接消费 workflow 预构建的 dist"
+  rsync -a "$WORKSPACE/frontend/dist/" "$RELEASE_DIR/frontend/dist/"
+else
+  log "在 release 目录内构建前端（NOT in _work）"
+  ( cd "$RELEASE_DIR/frontend" && npm ci --include=dev && npm run build )
+fi
+
+# 翻转软链 + 重启
+log "switching $CURRENT_LINK -> $RELEASE_DIR"
+ln -sfn "$RELEASE_DIR" "$CURRENT_LINK"
+log "restarting $SERVICE"
+systemctl restart "$SERVICE"
+
+# 健康检查
+for i in $(seq 1 10); do
+  if curl -fsS "$HEALTHZ" >/dev/null 2>&1; then
+    log "healthz OK"
+    break
+  fi
+  sleep 2
+done
+curl -fsS "$HEALTHZ" >/dev/null 2>&1 || die "healthz failed after deploy"
+
+log "deploy done: $ENV @ $SHA"

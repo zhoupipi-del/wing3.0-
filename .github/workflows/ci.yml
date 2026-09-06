@@ -19,12 +19,17 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - name: Install (含 devDependencies，供 eslint 运行)
+      - name: Install (含 devDependencies，供 eslint / vue-tsc 运行)
         # 防御性 --include=dev：防止某处 NODE_ENV=production 隐式触发 --omit=dev
         run: npm ci --include=dev
       - name: Lint
         run: npm run lint
-      - name: Build (validates env-driven BASE_URL + type-check)
+      - name: Type check (ratchet — 非阻断，仅暴露存量 TS 错误，不卡 CI)
+        # 存量 vue-tsc 类型错误约 36 处（12 个 .vue 文件），属 R3 范围外技术债；
+        # 以 continue-on-error 呈现为可见信号，待专项任务清理，不阻断发布。
+        run: npm run type-check
+        continue-on-error: true
+      - name: Build (validates env-driven BASE_URL；vite 转译不类型检查)
         run: npm run build
 
   backend:

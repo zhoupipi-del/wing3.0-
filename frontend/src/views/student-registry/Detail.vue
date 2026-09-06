@@ -225,7 +225,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ArrowLeft, Edit, SwitchButton, Promotion, Medal, Warning } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'

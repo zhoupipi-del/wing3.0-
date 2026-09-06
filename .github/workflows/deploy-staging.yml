@@ -3,6 +3,12 @@ name: Deploy Staging
 # 自动触发：push develop -> CI 通过(由分支保护/CI 状态保证) -> 此处部署 staging。
 # 仅此流水线使用 self-hosted runner（学校服务器）。CI 不在 self-hosted 跑。
 # Runner 仅执行受限 /usr/local/sbin/wings-deploy staging <sha> <workspace>，不持 root、不读 production.env。
+#
+# CI-STABILIZATION-R2（Runner 权限架构修复）：
+#   前端构建（npm ci / npm run build）改由本 workflow 以 runner 用户（wings-runner，非 root）
+#   在 _work 内完成，产物 dist 归 wings-runner 所有；sudo wings-deploy 只消费预构建产物
+#   （WINGS_DEPLOY_SKIP_BUILD=1），绝不在 _work 内以 root 跑 npm，避免 root-owned
+#   node_modules 污染 _work 导致下次 actions/checkout 清理失败（EACCES）。
 on:
   push:
     branches: [develop]
@@ -15,8 +21,15 @@ jobs:
       # 拉取 develop 引用，供 wrapper 自验 "SHA 属于 origin/develop"（不轻信传参）
       - name: Fetch develop ref for self-verification
         run: git fetch origin develop
-      - name: Deploy staging via restricted executor
-        run: sudo /usr/local/sbin/wings-deploy staging ${{ github.sha }} "$GITHUB_WORKSPACE"
+      # 前端构建：以 runner 用户（非 root）在 _work 内构建，dist 归 wings-runner 所有
+      - name: Build frontend artifact (runner user, NOT root)
+        working-directory: frontend
+        run: npm ci --include=dev && npm run build
+      # 受限执行器只消费预构建产物部署（WINGS_DEPLOY_SKIP_BUILD=1 告知其不要再构建）
+      - name: Deploy staging via restricted executor (consume prebuilt artifact)
+        # 用 sudo env 显式传参：sudo 默认 env_reset 会剥离命令行 VAR=val 赋值，
+        # 走 env 才能保证 wrapper 一定收到 SKIP_BUILD 标记。
+        run: sudo env WINGS_DEPLOY_SKIP_BUILD=1 /usr/local/sbin/wings-deploy staging ${{ github.sha }} "$GITHUB_WORKSPACE"
       - name: Health check (staging stack :8091)
         run: curl -fsS http://127.0.0.1:8091/s3-healthz
       - name: Smoke (staging /s3/)
