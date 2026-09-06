@@ -278,7 +278,7 @@ async def health_check():
 
 
 @router.get("/version")
-async def version_info(db: AsyncSession = Depends(get_db)):
+async def version_info(request: Request, db: AsyncSession = Depends(get_db)):
     """发布版本指纹（可确认性基础设施）
 
     用途：确认线上实际运行的是哪一版代码，不再靠日志/目录/猜测判断。
@@ -294,7 +294,7 @@ async def version_info(db: AsyncSession = Depends(get_db)):
     import os
     from pathlib import Path
 
-    from sqlalchemy import text
+    from sqlalchemy import select, text
 
     meta: dict = {}
     vpath = Path(__file__).resolve().parent.parent / "version.json"
@@ -312,13 +312,47 @@ async def version_info(db: AsyncSession = Depends(get_db)):
     except Exception:
         pass
 
-    return {
+    payload: dict = {
         "app": "Wings 3.0",
         "environment": os.getenv("ENV") or os.getenv("APP_ENV") or "unknown",
         "commit": meta.get("commit", "unknown"),
         "build_time": meta.get("build_time", "unknown"),
         "db_revision": db_revision,
     }
+
+    # 管理员增强：附加 release.json 明细（backend_sha / frontend_sha / release_tag / released_at）
+    # 兼容服务器上原管理员版 /version 的能力，避免本次合并导致功能丢失。
+    # 认证为 best-effort：无 token 或非管理员只返回公开指纹，不报错。
+    ADMIN_ROLES = {"ms_admin", "school_admin", "group_admin", "branch_admin"}
+    try:
+        token: str | None = None
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header.split(" ", 1)[1]
+        else:
+            token = request.cookies.get("access_token")
+
+        current_user = None
+        if token:
+            claims = AuthService.decode_token(token)
+            raw_id = claims.get("sub") or claims.get("user_id")
+            if raw_id:
+                res = await db.execute(
+                    select(User).where(User.id == int(raw_id), User.is_active.is_(True))
+                )
+                current_user = res.scalar_one_or_none()
+
+        role = getattr(current_user, "role", None)
+        role_value = getattr(role, "value", role)
+        if role_value in ADMIN_ROLES or str(role_value).lower() in ADMIN_ROLES:
+            release_json = Path(__file__).resolve().parent.parent.parent / "release.json"
+            if release_json.exists():
+                payload.update(json.loads(release_json.read_text(encoding="utf-8")))
+    except Exception:
+        # 增强信息属可选项，失败一律降级为公开指纹
+        pass
+
+    return payload
 
 
 # ═══════════════════════════════════════════════════════════════
