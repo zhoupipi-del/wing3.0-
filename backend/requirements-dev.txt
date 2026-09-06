@@ -10,3 +10,7 @@ pytest-asyncio>=0.24
 
 # HTTP 测试客户端（FastAPI 接口测试用）
 httpx>=0.27
+
+# 测试脚本依赖：tests/test_explainer_scenarios.py、tests/inject_research_data.py
+# 用 requests 调本地服务做端到端场景校验。生产代码不依赖 requests，故仅放 dev。
+requests>=2.31

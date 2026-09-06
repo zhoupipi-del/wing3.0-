@@ -10,7 +10,10 @@ export default [
   { ignores: ["dist/**", "node_modules/**"] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
-  ...pluginVue.configs["flat/vue3-recommended"],
+  // 原配置写 "flat/vue3-recommended"，但该 key 在 eslint-plugin-vue@9 不存在
+  // （仅 legacy .eslintrc 形态才有 vue3-recommended）。vue3 的 flat 等价项是
+  // "flat/recommended"。修正此 key 后 lint 才真正运行，而非在 spread 时崩溃。
+  ...pluginVue.configs["flat/recommended"],
   {
     // 为 .vue 的 <script lang="ts"> 块指定 TS parser
     files: ["**/*.vue"],
