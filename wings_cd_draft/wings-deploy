@@ -129,7 +129,11 @@ if [[ "$CMD" == staging ]]; then
   [[ -d "$FE_DIR" ]] || fail "前端目录缺失: $FE_DIR"
 
   # ── 构建：优先消费 workflow 预构建产物，否则在 _work 之外构建 ──
-  if [[ "${WINGS_DEPLOY_SKIP_BUILD:-0}" == "1" ]]; then
+  # 判定方式刻意不依赖环境变量传入：sudoers 仅放行本脚本路径且不允许 SETENV，
+  # `sudo VAR=1 <path>` 与 `sudo env VAR=1 <path>` 都会被拒。
+  # 改为"dist 存在即消费"：workflow 构建步骤会先 rm -rf dist 再 build，
+  # 因此 dist 存在 == 本次 job 刚构建成功，不存在则说明需由本脚本构建。
+  if [[ "${WINGS_DEPLOY_SKIP_BUILD:-0}" == "1" || -d "$FE_DIR/dist" ]]; then
     # workflow 已以 runner 用户(非 root)在 _work 内构建完毕，此处只消费
     [[ -d "$FE_DIR/dist" ]] \
       || fail "SKIP_BUILD=1 但 $FE_DIR/dist 不存在：workflow 未产出构件，拒绝部署"

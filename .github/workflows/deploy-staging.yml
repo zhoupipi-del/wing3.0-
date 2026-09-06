@@ -24,7 +24,12 @@ jobs:
       # 前端构建：以 runner 用户（非 root）在 _work 内构建，dist 归 wings-runner 所有
       - name: Build frontend artifact (runner user, NOT root)
         working-directory: frontend
-        run: npm ci --include=dev && npm run build
+        # 先 rm -rf dist：保证 dist 只可能是"本次 job 刚构建成功"的产物，
+        # 避免构建失败时残留旧 dist 被 wrapper 当成有效构件消费。
+        run: |
+          rm -rf dist
+          npm ci --include=dev
+          npm run build
       # 版本指纹：把本次 commit 写进代码树，随部署一起上线。
       # 线上 GET /api/v1/version 返回该 commit —— 与 GitHub 最新 commit 比对即可确认是否真的部署。
       - name: Write version fingerprint (staging)
@@ -33,11 +38,13 @@ jobs:
           printf '{"commit": "%s", "build_time": "%s", "environment": "staging"}\n' \
             "${{ github.sha }}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > version.json
           cat version.json
-      # 受限执行器只消费预构建产物部署（WINGS_DEPLOY_SKIP_BUILD=1 告知其不要再构建）
+      # 受限执行器只消费预构建产物部署。
+      # ⚠ 不要给 sudo 传任何环境变量：sudoers 仅放行 /usr/local/sbin/wings-deploy
+      #   且不允许 SETENV，`sudo VAR=1 <path>`(not allowed to set env) 与
+      #   `sudo env VAR=1 <path>`(命令变成 env，不在白名单需密码) 都会失败。
+      #   wrapper 改为"dist 存在即消费"自行判断，无需外部传参。
       - name: Deploy staging via restricted executor (consume prebuilt artifact)
-        # 用 sudo env 显式传参：sudo 默认 env_reset 会剥离命令行 VAR=val 赋值，
-        # 走 env 才能保证 wrapper 一定收到 SKIP_BUILD 标记。
-        run: sudo env WINGS_DEPLOY_SKIP_BUILD=1 /usr/local/sbin/wings-deploy staging ${{ github.sha }} "$GITHUB_WORKSPACE"
+        run: sudo /usr/local/sbin/wings-deploy staging ${{ github.sha }} "$GITHUB_WORKSPACE"
       - name: Health check (staging stack :8091)
         run: curl -fsS http://127.0.0.1:8091/s3-healthz
       - name: Smoke (staging /s3/)
