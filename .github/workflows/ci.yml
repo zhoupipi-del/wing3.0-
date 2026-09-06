@@ -19,8 +19,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - name: Install
-        run: npm ci
+      - name: Install (含 devDependencies，供 eslint 运行)
+        # 防御性 --include=dev：防止某处 NODE_ENV=production 隐式触发 --omit=dev
+        run: npm ci --include=dev
       - name: Lint
         run: npm run lint
       - name: Build (validates env-driven BASE_URL + type-check)
@@ -28,12 +29,18 @@ jobs:
 
   backend:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install
-        run: pip install -r backend/requirements.txt
+      - name: Install runtime deps
+        run: pip install -r requirements.txt
+      - name: Install test deps
+        run: pip install -r requirements-dev.txt
       - name: Tests
-        run: pytest backend/tests -q
+        # 用 python -m pytest 避免 PATH 未含裸 pytest 可执行时报 command not found
+        run: python -m pytest tests -q
