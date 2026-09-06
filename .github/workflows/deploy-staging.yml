@@ -25,6 +25,14 @@ jobs:
       - name: Build frontend artifact (runner user, NOT root)
         working-directory: frontend
         run: npm ci --include=dev && npm run build
+      # 版本指纹：把本次 commit 写进代码树，随部署一起上线。
+      # 线上 GET /api/v1/version 返回该 commit —— 与 GitHub 最新 commit 比对即可确认是否真的部署。
+      - name: Write version fingerprint (staging)
+        working-directory: backend
+        run: |
+          printf '{"commit": "%s", "build_time": "%s", "environment": "staging"}\n' \
+            "${{ github.sha }}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > version.json
+          cat version.json
       # 受限执行器只消费预构建产物部署（WINGS_DEPLOY_SKIP_BUILD=1 告知其不要再构建）
       - name: Deploy staging via restricted executor (consume prebuilt artifact)
         # 用 sudo env 显式传参：sudo 默认 env_reset 会剥离命令行 VAR=val 赋值，

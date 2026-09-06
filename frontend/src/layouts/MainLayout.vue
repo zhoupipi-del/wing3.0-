@@ -64,6 +64,12 @@
           家长请使用微信小程序或<a href="/" class="empty-link">家长门户</a>
         </p>
       </div>
+
+      <!-- 版本指纹：确认线上实际运行的是哪一版代码（与 GitHub 最新 commit 比对） -->
+      <div v-if="!isCollapsed" class="version-fingerprint" :title="versionTip">
+        WINGS 3.0 · {{ versionEnv }} ·
+        <code>{{ shortCommit }}</code>
+      </div>
     </el-aside>
 
     <!-- Main area -->
@@ -145,6 +151,7 @@ import { useUserStore } from '@/store/user'
 import { useTenantStore } from '@/store/tenant'
 import { getPendingCount } from '@/api/approval'
 import { getCurrentUser } from '@/api/auth'
+import request from '@/api/request'
 import NotificationBell from '@/views/notifications/NotificationBell.vue'
 import type { UserRole } from '@/types'
 
@@ -663,11 +670,36 @@ async function validateSession() {
   }
 }
 
+// ── 版本指纹（可确认性）──
+// 目的：一眼确认线上跑的是哪一版代码。GitHub 最新 commit == 此处 commit 即已部署。
+const versionEnv = ref('unknown')
+const versionCommit = ref('unknown')
+const versionBuildTime = ref('')
+
+const shortCommit = computed(() =>
+  versionCommit.value === 'unknown' ? 'unknown' : versionCommit.value.slice(0, 7),
+)
+const versionTip = computed(
+  () => `commit: ${versionCommit.value}\nbuild: ${versionBuildTime.value || 'unknown'}`,
+)
+
+async function loadVersionFingerprint() {
+  try {
+    const { data } = await request.get('/version')
+    versionEnv.value = data?.environment || 'unknown'
+    versionCommit.value = data?.commit || 'unknown'
+    versionBuildTime.value = data?.build_time || ''
+  } catch {
+    // 版本指纹属可观测性增强，失败不得影响主流程
+  }
+}
+
 onMounted(() => {
   validateSession()
   // Poll pending approval count every 60s
   fetchPendingCount()
   setInterval(fetchPendingCount, 60000)
+  loadVersionFingerprint()
 })
 </script>
 
@@ -707,6 +739,21 @@ onMounted(() => {
   font-size: 18px;
   font-weight: 600;
   white-space: nowrap;
+}
+
+.version-fingerprint {
+  margin-top: auto;
+  padding: 10px 16px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: rgba(255, 255, 255, 0.45);
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  user-select: all;
+}
+
+.version-fingerprint code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: rgba(255, 255, 255, 0.65);
 }
 
 .sidebar-menu {
