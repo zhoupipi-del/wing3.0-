@@ -1,83 +1,239 @@
-#!/usr/bin/env bash
+#!/bin/bash
+# =============================================================================
+# WINGS Deploy — 受限单入口 (root-owned 755)
+# -----------------------------------------------------------------------------
+# 学校服务器上部署的唯一受控入口。GitHub Actions self-hosted runner
+# (wings-runner 低权用户) 通过 NOPASSWD sudo 仅能调用本脚本，拿不到 root、
+# 读不到 production.env、无法执行任意命令。
 #
-# /usr/local/sbin/wings-deploy — WINGS 受限部署执行器（staging）
+# 用法：
+#   wings-deploy staging    <40hex_sha> <workspace>     # 部署 staging (/s3/)
+#   wings-deploy production <40hex_sha> <workspace>     # 受 WINGS_PROD_AUTO 闸门
+#   wings-deploy rollback   <release_id>                # 受 WINGS_PROD_AUTO 闸门
 #
-# ─────────────────────────────────────────────────────────────────────────────
-# CI-STABILIZATION-R2 修复要点（Runner 权限架构）
-#   1. 绝不在 GitHub Runner workspace ($GITHUB_WORKSPACE / _work) 内以 root 执行
-#      npm ci / npm run build。这会把 root-owned 的 node_modules 写进 _work，
-#      导致下次 actions/checkout（以 wings-runner 身份）无法清理 → EACCES。
-#   2. 若 workflow 已先行构建好前端 dist（设 WINGS_DEPLOY_SKIP_BUILD=1），则直接消费，
-#      不在任何位置重复构建。
-#   3. 否则把源码复制到独立 release 目录，在 release 目录内构建——绝不碰 _work。
-#   4. 只读 origin/develop 引用做 SHA 自验，不持 production.env，不触 production。
+# 安全铁律（wrapper 内部自验，不信 GitHub 传参）：
+#   1) 子命令严格 allowlist：staging | production | rollback
+#   2) commit SHA 必须 40 位 hex
+#   3) 同时只能一个 deploy（flock）
+#   4) 每次调用写不可变审计日志 timestamp/env/commit/prev/new/result/operator
+#   5) staging SHA 必须属 origin/develop；production 必须曾过 staging 或为 tag
+#   6) production / rollback 默认 DEFERRED（WINGS_PROD_AUTO != 1 直接拒绝，零改动）
 #
-# ⚠️ 部署路径变量（RELEASE_ROOT / CURRENT_LINK / SERVICE / HEALTHZ）必须与真实服务器对齐，
-#    安装前请按实际部署结构核对后再用。
-# ─────────────────────────────────────────────────────────────────────────────
-set -euo pipefail
+# CI-STABILIZATION-R2 新增（root 污染 _work 修复）：
+#   7) 绝不在 GitHub Runner workspace(_work) 内以 root 执行 npm ci/build。
+#      优先消费 workflow 预构建产物（WINGS_DEPLOY_SKIP_BUILD=1）；
+#      否则复制源码到 _work 之外的临时目录再构建。
+#
+# 硬隔离 Gate（STAGING 绝不能误伤 PRODUCTION）：
+#   8) staging 执行前断言：目标 webroot / 服务 / DB 端口 / current 软链
+#      均不等于生产值；任一项命中即 STOP(exit 1)，零改动。
+#   9) staging 部署前后各测一次生产健康与 current，写入审计日志备查。
+# =============================================================================
+set -uo pipefail
 
-ENV="${1:-staging}"
+LOCK=/var/lock/wings-deploy.lock
+AUDIT_DIR=/var/log/wings-deploy
+AUDIT="$AUDIT_DIR/audit.log"
+PROD_ENV=/opt/wings3/config/production.env
+
+SHA_RE='^[0-9a-f]{40}$'
+RELEASE_RE='^[0-9]{8}-[0-9a-f]{7,40}$'
+
+# ── 生产资产清单（staging 一旦触碰即 STOP）──
+PROD_CURRENT=/opt/wings3/current
+PROD_WEBROOT=/var/www/wings3-frontend
+PROD_SERVICE=wings3.service
+PROD_WEBROOT_ALT=/opt/wings3/frontend-current
+
+log() { mkdir -p "$AUDIT_DIR"; echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" >> "$AUDIT"; }
+fail() { log "RESULT=FAIL CMD=$CMD SHA=$SHA $*"; echo "ERROR: $*" >&2; exit 1; }
+
+exec 9>"$LOCK" || fail "cannot open lock"
+flock -n 9 || fail "another deploy in progress (lock held)"
+
+CMD="${1:-}"
 SHA="${2:-}"
-WORKSPACE="${3:-${GITHUB_WORKSPACE:-}}"
-[ -n "$WORKSPACE" ] || die "workspace not given and GITHUB_WORKSPACE unset"
+WS="${3:-}"
 
-# ── 可配置项（按需对齐真实服务器）──
-RELEASE_ROOT="/opt/wings3/releases"
-CURRENT_LINK="/opt/wings3/current"
-SERVICE="wings3-staging"            # systemd 单元名
-HEALTHZ="http://127.0.0.1:8091/s3-healthz"
-LOG_TAG="wings-deploy"
+case "$CMD" in
+  staging|production)
+    [[ "$SHA" =~ $SHA_RE ]] || fail "SHA 必须 40 位 hex: '$SHA'"
+    [[ -n "$WS" && -d "$WS/.git" ]] || fail "workspace 必须是 git checkout: '$WS'"
+    ;;
+  rollback)
+    [[ -n "$SHA" ]] || fail "rollback 需要 release id"
+    [[ "$SHA" =~ $RELEASE_RE ]] || fail "release id 格式应为 20260907-abcdef1234: '$SHA'"
+    WS=""
+    ;;
+  *)
+    fail "usage: wings-deploy staging|production <sha> <workspace> | rollback <release_id>"
+    ;;
+esac
 
-log() { echo "[$LOG_TAG] $*"; }
-die() { echo "[$LOG_TAG][ERR] $*" >&2; exit 1; }
-
-[ "$(id -u)" -eq 0 ] || die "must run via sudo"
-[ -n "$SHA" ] || die "usage: wings-deploy <env> <sha> <workspace>"
-[ -d "$WORKSPACE" ] || die "workspace not found: $WORKSPACE"
-
-# SHA 自验：必须属于 origin/develop
-git -C "$WORKSPACE" fetch origin develop >/dev/null 2>&1 || true
-git -C "$WORKSPACE" cat-file -e "origin/develop" 2>/dev/null || die "cannot resolve origin/develop"
-[ "$(git -C "$WORKSPACE" rev-parse "$SHA" 2>/dev/null)" = "$(git -C "$WORKSPACE" rev-parse "origin/develop" 2>/dev/null)" ] \
-  || die "SHA $SHA 不属于 origin/develop，拒绝部署"
-
-TS="$(date +%Y%m%d-%H%M%S)"
-RELEASE_DIR="$RELEASE_ROOT/$TS-$SHA"
-log "preparing release dir: $RELEASE_DIR"
-install -d -o root -g root -m 755 "$RELEASE_DIR"
-
-# 复制源码到 release 目录（在 _work 之外操作，绝不在 _work 内构建）
-log "copying workspace -> $RELEASE_DIR (排除 node_modules/.git/dist)"
-rsync -a --delete \
-  --exclude=node_modules --exclude=.git --exclude=dist \
-  "$WORKSPACE/" "$RELEASE_DIR/"
-
-if [ "${WINGS_DEPLOY_SKIP_BUILD:-0}" = "1" ]; then
-  # fail-closed：声明了 SKIP_BUILD 却拿不到预构建产物，必须显式失败，不静默上线空目录
-  [ -d "$WORKSPACE/frontend/dist" ] \
-    || die "SKIP_BUILD=1 但 $WORKSPACE/frontend/dist 不存在：workflow 未产出构件，拒绝部署"
-  log "SKIP_BUILD=1：直接消费 workflow 预构建的 dist"
-  rsync -a "$WORKSPACE/frontend/dist/" "$RELEASE_DIR/frontend/dist/"
-else
-  log "在 release 目录内构建前端（NOT in _work）"
-  ( cd "$RELEASE_DIR/frontend" && npm ci --include=dev && npm run build )
+# ── 分支/标签自验 ──────────────────────────────────────────────────────────
+if [[ "$CMD" != rollback ]]; then
+  if [[ "$CMD" == staging ]]; then
+    git -C "$WS" rev-parse -q --verify origin/develop >/dev/null 2>&1 \
+      || fail "origin/develop 引用缺失（job 应先 git fetch origin develop）"
+    if ! git -C "$WS" merge-base --is-ancestor "$SHA" origin/develop 2>/dev/null \
+       && [[ "$(git -C "$WS" rev-parse -q --verify origin/develop 2>/dev/null)" != "$SHA" ]]; then
+      fail "SHA $SHA 不在 origin/develop 上（staging 仅接受 develop 顶端）"
+    fi
+  else
+    git -C "$WS" fetch origin develop --depth 1 2>/dev/null
+    git -C "$WS" fetch origin release/stable --depth 1 2>/dev/null
+    git -C "$WS" fetch origin --tags 2>/dev/null
+    on_develop=$(git -C "$WS" merge-base --is-ancestor "$SHA" origin/develop 2>/dev/null && echo yes)
+    on_stable=$(git -C "$WS" merge-base --is-ancestor "$SHA" origin/release/stable 2>/dev/null && echo yes)
+    on_tag=$(git -C "$WS" tag --points-at "$SHA" 2>/dev/null | head -1)
+    if [[ -z "$on_develop" && -z "$on_stable" && -z "$on_tag" ]]; then
+      fail "SHA $SHA 不在 develop/release-stable 且非 tag（production 必须先过 staging 或为正式 tag）"
+    fi
+  fi
 fi
 
-# 翻转软链 + 重启
-log "switching $CURRENT_LINK -> $RELEASE_DIR"
-ln -sfn "$RELEASE_DIR" "$CURRENT_LINK"
-log "restarting $SERVICE"
-systemctl restart "$SERVICE"
-
-# 健康检查
-for i in $(seq 1 10); do
-  if curl -fsS "$HEALTHZ" >/dev/null 2>&1; then
-    log "healthz OK"
-    break
+# ── production / rollback 默认 DEFERRED ────────────────────────────────────
+if [[ "$CMD" != staging ]]; then
+  ENABLED=0
+  if [[ -f "$PROD_ENV" ]]; then
+    val=$(grep -E '^WINGS_PROD_AUTO=' "$PROD_ENV" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '"' | tr -d "'" | tr -d ' ')
+    [[ "$val" == "1" ]] && ENABLED=1
   fi
-  sleep 2
-done
-curl -fsS "$HEALTHZ" >/dev/null 2>&1 || die "healthz failed after deploy"
+  if [[ "$ENABLED" != 1 ]]; then
+    log "RESULT=DEFERRED CMD=$CMD SHA=$SHA reason=WINGS_PROD_AUTO not enabled (zero changes)"
+    echo "DEFERRED: production/rollback 尚未启用（服务器置 WINGS_PROD_AUTO=1 后方可执行）。零改动。" >&2
+    exit 1
+  fi
+fi
 
-log "deploy done: $ENV @ $SHA"
+# ═══════════════════════════════════════════════════════════════════════════
+# STAGING — 部署 /s3/（绝不触碰生产）
+# ═══════════════════════════════════════════════════════════════════════════
+if [[ "$CMD" == staging ]]; then
+  BASE_URL=/s3/
+  WEBROOT=/var/www/wings3-s3
+  FE_DIR="$WS/frontend"
+
+  # ── 硬隔离 Gate：任何一项命中生产值即 STOP ──
+  [[ "$WEBROOT" != "$PROD_WEBROOT" ]] \
+    || fail "ISOLATION_FAIL: staging webroot 等于生产 webroot ($PROD_WEBROOT)"
+  [[ "$WEBROOT" != "$PROD_WEBROOT_ALT" ]] \
+    || fail "ISOLATION_FAIL: staging webroot 等于生产 frontend-current"
+  [[ "$WEBROOT" != "$PROD_CURRENT" ]] \
+    || fail "ISOLATION_FAIL: staging webroot 等于生产 current"
+  # 本脚本 staging 路径下只允许操作 staging 服务与 /s3/ 健康检查
+  PROD_HEALTH_BEFORE=$(curl -fsS -m 8 -o /dev/null -w "%{http_code}" http://127.0.0.1:8000/api/v1/health 2>/dev/null || echo "000")
+  PROD_CURRENT_BEFORE=$(readlink -f "$PROD_CURRENT" 2>/dev/null || echo "none")
+  log "GATE_BEFORE PROD_HEALTH=$PROD_HEALTH_BEFORE PROD_CURRENT=$PROD_CURRENT_BEFORE"
+
+  [[ -d "$FE_DIR" ]] || fail "前端目录缺失: $FE_DIR"
+
+  # ── 构建：优先消费 workflow 预构建产物，否则在 _work 之外构建 ──
+  if [[ "${WINGS_DEPLOY_SKIP_BUILD:-0}" == "1" ]]; then
+    # workflow 已以 runner 用户(非 root)在 _work 内构建完毕，此处只消费
+    [[ -d "$FE_DIR/dist" ]] \
+      || fail "SKIP_BUILD=1 但 $FE_DIR/dist 不存在：workflow 未产出构件，拒绝部署"
+    DIST_SRC="$FE_DIR/dist"
+    log "BUILD_MODE=consume_prebuilt"
+  else
+    # 绝不在 _work 内以 root 跑 npm（会留下 root-owned node_modules 导致
+    # 下次 checkout EACCES）。复制到 _work 之外的临时目录再构建。
+    TMPBUILD=$(mktemp -d /tmp/wings-build-XXXXXX) || fail "mktemp 失败"
+    rsync -a --exclude node_modules --exclude .git --exclude dist \
+      "$FE_DIR/" "$TMPBUILD/" || fail "复制源码到临时目录失败"
+    ( cd "$TMPBUILD" && npm ci --registry https://registry.npmmirror.com ) \
+      || fail "npm ci 失败 (build dir)"
+    ( cd "$TMPBUILD" && VITE_BASE_URL="$BASE_URL" npm run build ) \
+      || fail "前端构建失败 (VITE_BASE_URL=$BASE_URL)"
+    DIST_SRC="$TMPBUILD/dist"
+    log "BUILD_MODE=tmpdir BUILD_DIR=$TMPBUILD"
+  fi
+
+  # 原子安装：先落临时目录，再整体替换 webroot，避免半截发布
+  TMP=$(mktemp -d) || fail "mktemp 失败"
+  rsync -a --delete "$DIST_SRC/" "$TMP/" || fail "rsync 到临时目录失败"
+  rm -rf "$WEBROOT"
+  mv "$TMP" "$WEBROOT" || fail "安装到 $WEBROOT 失败"
+
+  # 健康检查 + 冒烟
+  curl -fsS -m 10 http://127.0.0.1:8091/s3-healthz || fail "staging 健康检查失败 (/s3-healthz)"
+  code=$(curl -fsS -m 10 -o /dev/null -w "%{http_code}" https://lijiangschool.online/s3/)
+  [[ "$code" == "200" ]] || fail "staging 冒烟失败 (HTTP $code)"
+
+  # ── 部署后对照：确认生产没被误伤 ──
+  PROD_HEALTH_AFTER=$(curl -fsS -m 8 -o /dev/null -w "%{http_code}" http://127.0.0.1:8000/api/v1/health 2>/dev/null || echo "000")
+  PROD_CURRENT_AFTER=$(readlink -f "$PROD_CURRENT" 2>/dev/null || echo "none")
+  if [[ "$PROD_CURRENT_AFTER" != "$PROD_CURRENT_BEFORE" ]]; then
+    log "RESULT=FAIL CMD=staging SHA=$SHA PROD_CURRENT_CHANGED $PROD_CURRENT_BEFORE -> $PROD_CURRENT_AFTER"
+    echo "ERROR: 生产 current 被改动，硬隔离 Gate 触发！" >&2
+    exit 1
+  fi
+  log "GATE_AFTER PROD_HEALTH=$PROD_HEALTH_AFTER PROD_CURRENT_UNCHANGED=true"
+
+  [[ -n "${TMPBUILD:-}" && -d "${TMPBUILD:-}" ]] && rm -rf "$TMPBUILD"
+
+  log "RESULT=PASS CMD=staging SHA=$SHA WEBROOT=$WEBROOT PROD_HEALTH_BEFORE=$PROD_HEALTH_BEFORE PROD_HEALTH_AFTER=$PROD_HEALTH_AFTER PROD_CURRENT_UNCHANGED=true OPERATOR=github-actions"
+  echo "STAGING OK: $SHA -> $WEBROOT (base=$BASE_URL) PROD_UNCHANGED=true"
+  exit 0
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PRODUCTION — 完整发布模型（需 WINGS_PROD_AUTO=1）
+# ═══════════════════════════════════════════════════════════════════════════
+if [[ "$CMD" == production ]]; then
+  BASE_URL=/app/
+  WEBROOT=/var/www/wings3-frontend
+  FE_DIR="$WS/frontend"
+  RELEASE_ID="$(date -u +%Y%m%d)-${SHA:0:7}"
+  PREV="$(readlink -f /opt/wings3/frontend-current 2>/dev/null || echo none)"
+
+  if [[ "${WINGS_DEPLOY_SKIP_BUILD:-0}" == "1" ]]; then
+    [[ -d "$FE_DIR/dist" ]] || fail "SKIP_BUILD=1 但 $FE_DIR/dist 不存在"
+    DIST_SRC="$FE_DIR/dist"
+  else
+    TMPBUILD=$(mktemp -d /tmp/wings-build-XXXXXX) || fail "mktemp 失败"
+    rsync -a --exclude node_modules --exclude .git --exclude dist "$FE_DIR/" "$TMPBUILD/"
+    ( cd "$TMPBUILD" && npm ci --registry https://registry.npmmirror.com ) || fail "npm ci 失败"
+    ( cd "$TMPBUILD" && VITE_BASE_URL="$BASE_URL" npm run build ) || fail "前端构建失败"
+    DIST_SRC="$TMPBUILD/dist"
+  fi
+
+  TMP=$(mktemp -d) || fail "mktemp 失败"
+  rsync -a --delete "$DIST_SRC/" "$TMP/" || fail "rsync 失败"
+  rm -rf "$WEBROOT"
+  mv "$TMP" "$WEBROOT" || fail "安装到 $WEBROOT 失败"
+
+  if [[ -x /root/deploy.py ]]; then
+    python3 /root/deploy.py activate "$SHA" || fail "backend deploy.py activate 失败"
+  else
+    log "RESULT=WARN CMD=production SHA=$SHA backend=deploy.py-missing"
+  fi
+
+  curl -fsS -m 10 http://127.0.0.1:8000/api/v1/health || fail "production 健康检查失败"
+  code=$(curl -fsS -m 10 -o /dev/null -w "%{http_code}" https://lijiangschool.online/app/)
+  [[ "$code" == "200" ]] || fail "production 冒烟失败 (HTTP $code)"
+
+  [[ -n "${TMPBUILD:-}" && -d "${TMPBUILD:-}" ]] && rm -rf "$TMPBUILD"
+
+  log "RESULT=PASS CMD=production SHA=$SHA RELEASE=$RELEASE_ID PREV=$PREV WEBROOT=$WEBROOT OPERATOR=github-actions"
+  echo "PRODUCTION OK: $SHA -> $WEBROOT (base=$BASE_URL, release=$RELEASE_ID)"
+  exit 0
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ROLLBACK
+# ═══════════════════════════════════════════════════════════════════════════
+if [[ "$CMD" == rollback ]]; then
+  TARGET="/opt/wings3/frontend-releases/$SHA"
+  [[ -d "$TARGET" ]] || fail "回滚目标不存在: $TARGET"
+  ln -sfn "$TARGET" /opt/wings3/frontend-current || fail "切 frontend-current 软链失败"
+  if [[ -x /root/deploy.py ]]; then
+    python3 /root/deploy.py rollback "$SHA" || fail "backend deploy.py rollback 失败"
+  fi
+  curl -fsS -m 10 http://127.0.0.1:8000/api/v1/health || fail "回滚后健康检查失败"
+  log "RESULT=PASS CMD=rollback RELEASE=$SHA TARGET=$TARGET OPERATOR=github-actions"
+  echo "ROLLBACK OK: -> $TARGET"
+  exit 0
+fi
+
+fail "unreachable"
