@@ -39,7 +39,7 @@ class TestCreateClass:
         cls = await ClassMgmtService.create_class(db, 1, data)
 
         assert cls.name == "2501"
-        assert cls.is_active == True
+        assert cls.is_active is True
         assert cls.student_count == 0
 
     @pytest.mark.asyncio
@@ -78,7 +78,13 @@ class TestAssignStudents:
         cls = MagicMock()
         cls.school_id = 1
         cls.student_count = 30
-        db.get = AsyncMock(side_effect=[cls, MagicMock(), MagicMock()])
+        # 学生 Mock 必须带 school_id，否则会被 school 作用域校验判为"不属于本校"
+        # 而进入 failed，导致 assigned==[]（原 fixture 漏设 school_id，属测试固件缺陷，非业务回归）
+        student_a = MagicMock()
+        student_a.school_id = 1
+        student_b = MagicMock()
+        student_b.school_id = 1
+        db.get = AsyncMock(side_effect=[cls, student_a, student_b])
 
         db.add = MagicMock()
 

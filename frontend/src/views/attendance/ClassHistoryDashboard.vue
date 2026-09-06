@@ -93,7 +93,7 @@
     <div class="detail-section" v-if="!isLoading && abnormalDays.length > 0">
       <div class="section-header">
         <el-icon><Warning /></el-icon>
-        <span>异常日期明细 (出勤率 < 90% 或 缺勤 ≥ 3人次)</span>
+        <span>异常日期明细 (出勤率 &lt; 90% 或 缺勤 ≥ 3人次)</span>
       </div>
       <el-table :data="abnormalDays" stripe class="abnormal-table" size="small" max-height="300">
         <el-table-column prop="date" label="日期" width="120" />

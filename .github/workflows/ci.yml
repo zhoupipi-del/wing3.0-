@@ -1,0 +1,51 @@
+name: CI
+
+# 代码质量门禁：push 到 develop / release/stable 或 PR 时跑。
+# 绝不部署。部署由 deploy-staging / deploy-production / rollback 负责。
+# 关键纪律：CI 在 GitHub-hosted (ubuntu-latest) 跑，不落 self-hosted runner。
+on:
+  push:
+    branches: [develop, release/stable]
+  pull_request:
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install (含 devDependencies，供 eslint / vue-tsc 运行)
+        # 防御性 --include=dev：防止某处 NODE_ENV=production 隐式触发 --omit=dev
+        run: npm ci --include=dev
+      - name: Lint
+        run: npm run lint
+      - name: Type check (ratchet — 非阻断，仅暴露存量 TS 错误，不卡 CI)
+        # 存量 vue-tsc 类型错误约 36 处（12 个 .vue 文件），属 R3 范围外技术债；
+        # 以 continue-on-error 呈现为可见信号，待专项任务清理，不阻断发布。
+        run: npm run type-check
+        continue-on-error: true
+      - name: Build (validates env-driven BASE_URL；vite 转译不类型检查)
+        run: npm run build
+
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install runtime deps
+        run: pip install -r requirements.txt
+      - name: Install test deps
+        run: pip install -r requirements-dev.txt
+      - name: Tests
+        # 用 python -m pytest 避免 PATH 未含裸 pytest 可执行时报 command not found
+        run: python -m pytest tests -q

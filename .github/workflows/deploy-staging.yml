@@ -1,0 +1,53 @@
+name: Deploy Staging
+
+# 自动触发：push develop -> CI 通过(由分支保护/CI 状态保证) -> 此处部署 staging。
+# 仅此流水线使用 self-hosted runner（学校服务器）。CI 不在 self-hosted 跑。
+# Runner 仅执行受限 /usr/local/sbin/wings-deploy staging <sha> <workspace>，不持 root、不读 production.env。
+#
+# CI-STABILIZATION-R2（Runner 权限架构修复）：
+#   前端构建（npm ci / npm run build）改由本 workflow 以 runner 用户（wings-runner，非 root）
+#   在 _work 内完成，产物 dist 归 wings-runner 所有；sudo wings-deploy 只消费预构建产物
+#   （WINGS_DEPLOY_SKIP_BUILD=1），绝不在 _work 内以 root 跑 npm，避免 root-owned
+#   node_modules 污染 _work 导致下次 actions/checkout 清理失败（EACCES）。
+on:
+  push:
+    branches: [develop]
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, wings-deploy]
+    steps:
+      - uses: actions/checkout@v4
+      # 拉取 develop 引用，供 wrapper 自验 "SHA 属于 origin/develop"（不轻信传参）
+      - name: Fetch develop ref for self-verification
+        run: git fetch origin develop
+      # 前端构建：以 runner 用户（非 root）在 _work 内构建，dist 归 wings-runner 所有
+      - name: Build frontend artifact (runner user, NOT root)
+        working-directory: frontend
+        # 先 rm -rf dist：保证 dist 只可能是"本次 job 刚构建成功"的产物，
+        # 避免构建失败时残留旧 dist 被 wrapper 当成有效构件消费。
+        run: |
+          rm -rf dist
+          npm ci --include=dev
+          npm run build
+      # 版本指纹：把本次 commit 写进代码树，随部署一起上线。
+      # 线上 GET /api/v1/version 返回该 commit —— 与 GitHub 最新 commit 比对即可确认是否真的部署。
+      - name: Write version fingerprint (staging)
+        working-directory: backend
+        run: |
+          printf '{"commit": "%s", "build_time": "%s", "environment": "staging"}\n' \
+            "${{ github.sha }}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > version.json
+          cat version.json
+      # 受限执行器只消费预构建产物部署。
+      # ⚠ 不要给 sudo 传任何环境变量：sudoers 仅放行 /usr/local/sbin/wings-deploy
+      #   且不允许 SETENV，`sudo VAR=1 <path>`(not allowed to set env) 与
+      #   `sudo env VAR=1 <path>`(命令变成 env，不在白名单需密码) 都会失败。
+      #   wrapper 改为"dist 存在即消费"自行判断，无需外部传参。
+      - name: Deploy staging via restricted executor (consume prebuilt artifact)
+        run: sudo /usr/local/sbin/wings-deploy staging ${{ github.sha }} "$GITHUB_WORKSPACE"
+      - name: Health check (staging stack :8091)
+        run: curl -fsS http://127.0.0.1:8091/s3-healthz
+      - name: Smoke (staging /s3/)
+        run: |
+          code=$(curl -fsS -o /dev/null -w "%{http_code}" https://lijiangschool.online/s3/)
+          [ "$code" = "200" ] || exit 1

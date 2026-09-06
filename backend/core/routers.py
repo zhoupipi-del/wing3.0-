@@ -73,7 +73,7 @@ async def get_current_user(
     result = await db.execute(
         select(User)
         .options(selectinload(User.school))
-        .where(User.id == int(raw_id), User.is_active == True)
+        .where(User.id == int(raw_id), User.is_active.is_(True))
     )
     user = result.scalar_one_or_none()
     if not user:
@@ -275,6 +275,84 @@ async def get_tenant_context(
 @router.get("/health", response_model=MessageResponse)
 async def health_check():
     return MessageResponse(message="ok", detail="Wings 3.0 Core Online")
+
+
+@router.get("/version")
+async def version_info(request: Request, db: AsyncSession = Depends(get_db)):
+    """发布版本指纹（可确认性基础设施）
+
+    用途：确认线上实际运行的是哪一版代码，不再靠日志/目录/猜测判断。
+
+    验收口诀：
+        GitHub 最新 commit == 本接口 commit  →  确实已部署
+        GitHub 最新 commit != 本接口 commit  →  没部署上去
+
+    version.json 由 CI 在构建阶段生成（含 commit_sha / build_time），
+    随代码一起部署；若缺失则回退 unknown，不影响服务可用性。
+    """
+    import json
+    import os
+    from pathlib import Path
+
+    from sqlalchemy import select, text
+
+    meta: dict = {}
+    vpath = Path(__file__).resolve().parent.parent / "version.json"
+    try:
+        if vpath.is_file():
+            meta = json.loads(vpath.read_text(encoding="utf-8"))
+    except Exception:
+        meta = {}
+
+    db_revision = "unknown"
+    try:
+        row = (await db.execute(text("SELECT version_num FROM alembic_version LIMIT 1"))).first()
+        if row:
+            db_revision = row[0]
+    except Exception:
+        pass
+
+    payload: dict = {
+        "app": "Wings 3.0",
+        "environment": os.getenv("ENV") or os.getenv("APP_ENV") or "unknown",
+        "commit": meta.get("commit", "unknown"),
+        "build_time": meta.get("build_time", "unknown"),
+        "db_revision": db_revision,
+    }
+
+    # 管理员增强：附加 release.json 明细（backend_sha / frontend_sha / release_tag / released_at）
+    # 兼容服务器上原管理员版 /version 的能力，避免本次合并导致功能丢失。
+    # 认证为 best-effort：无 token 或非管理员只返回公开指纹，不报错。
+    ADMIN_ROLES = {"ms_admin", "school_admin", "group_admin", "branch_admin"}
+    try:
+        token: str | None = None
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header.split(" ", 1)[1]
+        else:
+            token = request.cookies.get("access_token")
+
+        current_user = None
+        if token:
+            claims = AuthService.decode_token(token)
+            raw_id = claims.get("sub") or claims.get("user_id")
+            if raw_id:
+                res = await db.execute(
+                    select(User).where(User.id == int(raw_id), User.is_active.is_(True))
+                )
+                current_user = res.scalar_one_or_none()
+
+        role = getattr(current_user, "role", None)
+        role_value = getattr(role, "value", role)
+        if role_value in ADMIN_ROLES or str(role_value).lower() in ADMIN_ROLES:
+            release_json = Path(__file__).resolve().parent.parent.parent / "release.json"
+            if release_json.exists():
+                payload.update(json.loads(release_json.read_text(encoding="utf-8")))
+    except Exception:
+        # 增强信息属可选项，失败一律降级为公开指纹
+        pass
+
+    return payload
 
 
 # ═══════════════════════════════════════════════════════════════
