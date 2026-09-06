@@ -6,7 +6,7 @@ import { ElementPlusResolver } from 'unplugin-vue-components/resolvers'
 import { resolve } from 'path'
 
 export default defineConfig({
-  base: '/app/',
+  base: process.env.VITE_BASE_URL || '/app/',
   plugins: [
     vue(),
     AutoImport({

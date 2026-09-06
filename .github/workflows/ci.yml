@@ -1,0 +1,39 @@
+name: CI
+
+# 代码质量门禁：push 到 develop / release/stable 或 PR 时跑。
+# 绝不部署。部署由 deploy-staging / deploy-production / rollback 负责。
+# 关键纪律：CI 在 GitHub-hosted (ubuntu-latest) 跑，不落 self-hosted runner。
+on:
+  push:
+    branches: [develop, release/stable]
+  pull_request:
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install
+        run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Build (validates env-driven BASE_URL + type-check)
+        run: npm run build
+
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install -r backend/requirements.txt
+      - name: Tests
+        run: pytest backend/tests -q

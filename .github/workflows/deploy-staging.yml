@@ -1,0 +1,25 @@
+name: Deploy Staging
+
+# 自动触发：push develop -> CI 通过(由分支保护/CI 状态保证) -> 此处部署 staging。
+# 仅此流水线使用 self-hosted runner（学校服务器）。CI 不在 self-hosted 跑。
+# Runner 仅执行受限 /usr/local/sbin/wings-deploy staging <sha> <workspace>，不持 root、不读 production.env。
+on:
+  push:
+    branches: [develop]
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, wings-deploy]
+    steps:
+      - uses: actions/checkout@v4
+      # 拉取 develop 引用，供 wrapper 自验 "SHA 属于 origin/develop"（不轻信传参）
+      - name: Fetch develop ref for self-verification
+        run: git fetch origin develop
+      - name: Deploy staging via restricted executor
+        run: sudo /usr/local/sbin/wings-deploy staging ${{ github.sha }} "$GITHUB_WORKSPACE"
+      - name: Health check (staging stack :8091)
+        run: curl -fsS http://127.0.0.1:8091/s3-healthz
+      - name: Smoke (staging /s3/)
+        run: |
+          code=$(curl -fsS -o /dev/null -w "%{http_code}" https://lijiangschool.online/s3/)
+          [ "$code" = "200" ] || exit 1

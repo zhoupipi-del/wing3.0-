@@ -1,0 +1,40 @@
+name: Deploy Production
+
+# 手动触发 + 人工 Approve（GitHub Environment protection）。
+# 输入完整 40 位 commit SHA；SHA 必须曾过 staging(在 develop 上) 或为正式 tag / release/stable 顶端。
+# 仓库当前无 main 分支，production 等价分支为 release/stable；闸门放宽为 develop|tag|release/stable。
+# 注意：本流水线默认处于 DEFERRED 状态（wrapper 内 WINGS_PROD_AUTO 未开），
+#       仅 staging 端到端 + rollback 验证通过后才在服务器置位启用，避免误触生产。
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: "要发布的 commit sha（须曾过 staging 的 develop，或正式 tag / release/stable 顶端）"
+        required: true
+        default: ""
+
+jobs:
+  approve:
+    runs-on: ubuntu-latest
+    environment: production-approval # GitHub Environment 开启 Required reviewer 人工审批
+    steps:
+      - run: echo "Production deploy approved for ${{ inputs.commit }}"
+
+  deploy:
+    needs: approve
+    runs-on: [self-hosted, wings-deploy]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch refs for self-verification
+        run: |
+          git fetch origin develop
+          git fetch origin release/stable
+          git fetch origin --tags
+      - name: Deploy production via restricted executor
+        run: sudo /usr/local/sbin/wings-deploy production ${{ inputs.commit }} "$GITHUB_WORKSPACE"
+      - name: Health check (production :8000)
+        run: curl -fsS http://127.0.0.1:8000/api/v1/health
+      - name: Smoke (production /app/)
+        run: |
+          code=$(curl -fsS -o /dev/null -w "%{http_code}" https://lijiangschool.online/app/)
+          [ "$code" = "200" ] || exit 1

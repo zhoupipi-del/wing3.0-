@@ -1,0 +1,21 @@
+name: Rollback
+
+# 手动触发：选择上一 release 一键回滚。
+# release id 形如 20260907-abcdef1234（日期-commit 前缀）。
+# 同 production：默认 DEFERRED（WINGS_PROD_AUTO 未开时不改动生产），验证阶段通过后才启用。
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "回滚目标 release id（如 20260907-abcdef1234）"
+        required: true
+        default: ""
+
+jobs:
+  rollback:
+    runs-on: [self-hosted, wings-deploy]
+    steps:
+      - name: Rollback via restricted executor
+        run: sudo /usr/local/sbin/wings-deploy rollback ${{ inputs.release }}
+      - name: Health check (production :8000)
+        run: curl -fsS http://127.0.0.1:8000/api/v1/health
