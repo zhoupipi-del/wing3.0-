@@ -61,13 +61,20 @@ def _distribution(bind) -> list[tuple]:
 def upgrade() -> None:
     bind = op.get_bind()
 
-    # ── 0) 环境身份断言（TRAP 防线：只允许 wings3_staging / 3308）──
+    # ── 0) 环境身份断言（TRAP 防线：只允许 staging）──
+    # 端口判定用「连接 URL 端口」而非 @@port（容器内端口恒为 3306，2026-09-07 实测修正）。
+    import os
+    from urllib.parse import urlparse
+
     db_name = bind.execute(sa.text("SELECT DATABASE()")).scalar()
-    db_port = bind.execute(sa.text("SELECT @@port")).scalar()
-    if db_name != "wings3_staging" or int(db_port or 0) != 3308:
+    db_port_server = bind.execute(sa.text("SELECT @@port")).scalar()
+    env_url = os.environ.get("DATABASE_URL", "")
+    env_port = urlparse(env_url.replace("mysql+aiomysql://", "mysql://")).port
+    if db_name != "wings3_staging" or int(env_port or 0) != 3308:
         raise RuntimeError(
             f"ENV GUARD ABORT: 本 migration 仅允许 staging "
-            f"(db=wings3_staging, port=3308)，实际 db={db_name}, port={db_port}"
+            f"(DATABASE_URL port=3308 + DATABASE()=wings3_staging)，实际 "
+            f"db={db_name}, url_port={env_port}, @@port(server-internal)={db_port_server}"
         )
 
     # ── 1) 前置取证：ENUM 原文 + 数据分布（如实记录，不假设 8/9 态）──
@@ -110,11 +117,16 @@ def upgrade() -> None:
 def downgrade() -> None:
     """对称回退：仅移除 DEFAULT（ENUM/数据不触碰）。"""
     bind = op.get_bind()
+    import os
+    from urllib.parse import urlparse
+
     db_name = bind.execute(sa.text("SELECT DATABASE()")).scalar()
-    db_port = bind.execute(sa.text("SELECT @@port")).scalar()
-    if db_name != "wings3_staging" or int(db_port or 0) != 3308:
+    env_port = urlparse(
+        os.environ.get("DATABASE_URL", "").replace("mysql+aiomysql://", "mysql://")
+    ).port
+    if db_name != "wings3_staging" or int(env_port or 0) != 3308:
         raise RuntimeError(
             f"ENV GUARD ABORT: downgrade 同样仅允许 staging "
-            f"(db={db_name}, port={db_port})"
+            f"(db={db_name}, url_port={env_port})"
         )
     op.execute(sa.text("ALTER TABLE ai_runs ALTER COLUMN status DROP DEFAULT"))

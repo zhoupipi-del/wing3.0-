@@ -48,13 +48,22 @@ def _columns(bind, table: str) -> set[str]:
 def upgrade() -> None:
     bind = op.get_bind()
 
-    # ── 0) 环境身份断言（防 TRAP：只允许 wings3_staging / 3308 执行本 migration）──
+    # ── 0) 环境身份断言（防 TRAP：只允许 staging 执行本 migration）──
+    # 端口判定用「连接 URL 端口」而非 @@port：容器化部署中 wings3-staging-db
+    # 为 127.0.0.1:3308->3306/tcp，SELECT @@port 自报容器内端口 3306（恒定），
+    # 不能作为宿主端口证据（2026-09-07 BREAK-GLASS 实测修正）。
+    import os
+    from urllib.parse import urlparse
+
     db_name = bind.execute(sa.text("SELECT DATABASE()")).scalar()
-    db_port = bind.execute(sa.text("SELECT @@port")).scalar()
-    if db_name != "wings3_staging" or int(db_port or 0) != 3308:
+    db_port_server = bind.execute(sa.text("SELECT @@port")).scalar()
+    env_url = os.environ.get("DATABASE_URL", "")
+    env_port = urlparse(env_url.replace("mysql+aiomysql://", "mysql://")).port
+    if db_name != "wings3_staging" or int(env_port or 0) != 3308:
         raise RuntimeError(
             f"ENV GUARD ABORT: 本次 reconciliation 仅允许 staging "
-            f"(db=wings3_staging, port=3308)，实际 db={db_name}, port={db_port}"
+            f"(DATABASE_URL port=3308 + DATABASE()=wings3_staging)，实际 "
+            f"db={db_name}, url_port={env_port}, @@port(server-internal)={db_port_server}"
         )
 
     # ── 1) 声明式 ADD COLUMN（nullable，无 default；已存在则跳过）──

@@ -71,15 +71,23 @@ def connect():
 
 
 def guard(conn) -> str:
+    # 端口断言用「实际连接端口」（pymysql conn.port）而非 SELECT @@port：
+    # 容器化部署中 wings3-staging-db 为 127.0.0.1:3308->3306/tcp，@@port 自报
+    # 容器内端口 3306（2026-09-07 BREAK-GLASS 实测修正）。
+    if conn.port != EXPECTED_PORT or conn.host not in ("127.0.0.1", "localhost"):
+        die(f"连接端口断言失败: host={conn.host}, port={conn.port} "
+            f"(expected 127.0.0.1:{EXPECTED_PORT})")
     with conn.cursor() as cur:
-        cur.execute("SELECT DATABASE(), @@port")
-        db, port = cur.fetchone()
+        cur.execute("SELECT DATABASE()")
+        db = cur.fetchone()[0]
+        cur.execute("SELECT @@port")  # 仅记录（容器内端口），不参与判定
+        server_port = cur.fetchone()[0]
         cur.execute("SELECT version_num FROM alembic_version ORDER BY version_num")
         versions = [r[0] for r in cur.fetchall()]
-    if db != EXPECTED_DB or int(port) != EXPECTED_PORT:
-        die(f"环境身份断言失败: db={db}, port={port} "
-            f"(expected {EXPECTED_DB}/{EXPECTED_PORT})")
-    print(f"[GUARD] db={db} port={port} OK")
+    if db != EXPECTED_DB:
+        die(f"环境身份断言失败: db={db} (expected {EXPECTED_DB})")
+    print(f"[GUARD] db={db} conn={conn.host}:{conn.port} OK "
+          f"(@@port server-internal={server_port}, 仅记录)")
     print(f"[GUARD] alembic_version = {versions}")
     return versions
 
@@ -156,10 +164,8 @@ def regression(conn) -> None:
     checks = [
         ("ai_runs.status default == PLANNING", cdefault == "PLANNING"),
         ("ai_runs.status nullable == NO（未改变）", cnull == "NO"),
-        ("ai_runs.status ENUM 含 8 基线态",
-         all(m in ctype for m in
-             ("PLANNING", "POLICY_CHECK", "EXECUTING", "WAITING_APPROVAL",
-              "RECOVERING", "RESUMING", "COMPLETED", "FAILED"))),
+        # 按 E1 新口径不裁决 8/9 态：COLUMN_TYPE 已如实打印于下方，
+        # 不变性由 migration 内部 before==after 逐字节断言保证。
         ("warning_feedback.school_id 列存在", wf_school == 1),
         ("warning_feedback unresolved == 0", unresolved == 0),
         ("warning_feedback FK 存在", fk == 1),
