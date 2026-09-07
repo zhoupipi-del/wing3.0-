@@ -39,8 +39,10 @@ STATUS_LABELS = {
     "PENDING": "待年级组长初审",
     "GRADE_LEADER_APPROVED": "年级组长已审，待终审",
     "ACTIVE": "生效中",
+    "PARENT_COMMUNICATED": "家长已沟通",
     "REJECTED": "已驳回",
     "REVOKED": "已撤销",
+    "CLOSED": "已结案",
 }
 
 
@@ -433,6 +435,82 @@ class DisciplineService:
         await db.refresh(sanction)
         logger.info(
             f"🔄 处分已撤销: student_id={sanction.student_id} "
+            f"level={sanction.level.value} id={sanction.id}"
+        )
+        return sanction
+
+    # ═══════════════════════════════════════════════════════════
+    # 状态机: 家长沟通 (ACTIVE → PARENT_COMMUNICATED)
+    # ═══════════════════════════════════════════════════════════
+
+    @staticmethod
+    async def mark_parent_communicated(
+        db: AsyncSession,
+        sanction_id: int,
+    ) -> DisciplineSanction | None:
+        """
+        家长沟通完成 — ACTIVE → PARENT_COMMUNICATED
+
+        家校闭环关键节点: 处分生效后，责任教师/年级/德育处
+        与家长完成沟通，标记进入「待结案」状态。
+        注: 沟通内容留痕列 (parent_communicated_at/note) 属 Stable Release
+            后增强，本步仅推进状态机 + updated_at 时间戳。
+        """
+        sanction = await _query_by_id(db, sanction_id)
+        if not sanction:
+            return None
+        if sanction.status != DisciplineStatus.ACTIVE:
+            raise ValueError(f"只能对已生效处分标记家长沟通，当前状态: {sanction.status.value}")
+
+        sanction.status = DisciplineStatus.PARENT_COMMUNICATED
+        sanction.updated_at = get_local_now()
+
+        # 🔔 通知多方（家长沟通完成）
+        await DisciplineService._notify_on_discipline_event(
+            db, sanction, "parent_communicated"
+        )
+
+        await db.commit()
+        await db.refresh(sanction)
+        logger.info(
+            f"📞 家长沟通完成: student_id={sanction.student_id} "
+            f"level={sanction.level.value} id={sanction.id}"
+        )
+        return sanction
+
+    # ═══════════════════════════════════════════════════════════
+    # 状态机: 结案 (PARENT_COMMUNICATED → CLOSED)
+    # ═══════════════════════════════════════════════════════════
+
+    @staticmethod
+    async def close_sanction(
+        db: AsyncSession,
+        sanction_id: int,
+    ) -> DisciplineSanction | None:
+        """
+        结案归档 — PARENT_COMMUNICATED → CLOSED
+
+        处分生命周期终结节点: 家长沟通完成后，
+        年级组长/德育处确认结案，闭环结束。
+        """
+        sanction = await _query_by_id(db, sanction_id)
+        if not sanction:
+            return None
+        if sanction.status != DisciplineStatus.PARENT_COMMUNICATED:
+            raise ValueError(f"只能对「家长已沟通」处分结案，当前状态: {sanction.status.value}")
+
+        sanction.status = DisciplineStatus.CLOSED
+        sanction.updated_at = get_local_now()
+
+        # 🔔 通知多方（结案）
+        await DisciplineService._notify_on_discipline_event(
+            db, sanction, "closed"
+        )
+
+        await db.commit()
+        await db.refresh(sanction)
+        logger.info(
+            f"✅ 处分已结案: student_id={sanction.student_id} "
             f"level={sanction.level.value} id={sanction.id}"
         )
         return sanction

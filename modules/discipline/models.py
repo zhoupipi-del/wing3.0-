@@ -3,11 +3,13 @@ modules/discipline/models.py — 处分登记模型
 
 表: discipline_sanctions — 处分档案表（独立于 behavior_records）
 
-生命周期状态机 (二级审批):
+生命周期状态机 (二级审批 + 闭环):
   DRAFT_PENDING → PENDING               (班主任确认提交)
   PENDING       → GRADE_LEADER_APPROVED (年级组长初审通过)
   GRADE_LEADER_APPROVED → ACTIVE        (德育处终审通过，生效扣分)
   PENDING / GRADE_LEADER_APPROVED → REJECTED (任一阶段驳回)
+  ACTIVE        → PARENT_COMMUNICATED   (家长已沟通，家校闭环)
+  PARENT_COMMUNICATED → CLOSED           (结案归档，处分生命周期终结)
   ACTIVE        → REVOKED               (表现良好，撤销处分)
 
 与违纪溯源: behavior_record_id → behavior_records.id
@@ -45,6 +47,10 @@ class DisciplineStatus(str, enum.Enum):
     ACTIVE = "ACTIVE"                        # 德育处终审通过，正式生效
     REJECTED = "REJECTED"                    # 审批驳回（年级组长或德育处均可驳回），归档留痕
     REVOKED = "REVOKED"                      # 处分被撤销／解除（表现良好申请通过）
+    # ↓ 家校闭环（G5 port）：必须追加在末尾 —— MySQL ENUM 按位置存索引，
+    #   插在中间会让既有 REJECTED/REVOKED 的索引错位，造成静默数据损坏
+    PARENT_COMMUNICATED = "PARENT_COMMUNICATED"  # 家长已沟通（家校闭环，处分进入待结案）
+    CLOSED = "CLOSED"                        # 已结案归档（处分生命周期终结）
 
 
 # 处分等级 → 中文标签
@@ -117,7 +123,7 @@ class DisciplineSanction(Base, SchoolMixin):
     status = Column(
         SQLEnum(DisciplineStatus), nullable=False,
         default=DisciplineStatus.PENDING, index=True,
-        comment="生命周期状态: DRAFT_PENDING/PENDING/ACTIVE/REJECTED/REVOKED"
+        comment="生命周期状态: DRAFT_PENDING/PENDING/GRADE_LEADER_APPROVED/ACTIVE/PARENT_COMMUNICATED/CLOSED/REJECTED/REVOKED"
     )
     reason = Column(Text, nullable=False, comment="处分事由")
     document_no = Column(String(50), nullable=True, comment="德育处红头文件编号 (如: 梨中德字[2026]05号)")

@@ -368,6 +368,63 @@ async def revoke_sanction(
 
 
 # ═══════════════════════════════════════════════════════════════
+# 状态机: 家长沟通 (ACTIVE → PARENT_COMMUNICATED)
+# ═══════════════════════════════════════════════════════════════
+
+
+@router.post("/sanctions/{sanction_id}/parent-communicated")
+async def mark_parent_communicated(
+    sanction_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    _guard: User = Depends(
+        require_role(UserRole.MS_ADMIN, UserRole.GRADE_LEADER, UserRole.CLASS_TEACHER)
+    ),
+):
+    """
+    家长沟通完成 — ACTIVE → PARENT_COMMUNICATED
+
+    角色守卫: 德育处 / 年级组长 / 班主任（谁与家长沟通谁标记）。
+    多租户隔离: verify_entity_ownership 强制归属校验。
+    """
+    from .models import DisciplineSanction
+
+    await verify_entity_ownership(db, DisciplineSanction, sanction_id, current_user, "处分记录不存在")
+    try:
+        sanction = await DisciplineService.mark_parent_communicated(db, sanction_id)
+        if not sanction:
+            raise HTTPException(status_code=404, detail="处分记录不存在")
+        return _format(sanction)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/sanctions/{sanction_id}/close")
+async def close_sanction(
+    sanction_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    _guard: User = Depends(require_role(UserRole.MS_ADMIN, UserRole.GRADE_LEADER)),
+):
+    """
+    结案归档 — PARENT_COMMUNICATED → CLOSED
+
+    角色守卫: 德育处 / 年级组长（闭环终点确认）。
+    多租户隔离: verify_entity_ownership 强制归属校验。
+    """
+    from .models import DisciplineSanction
+
+    await verify_entity_ownership(db, DisciplineSanction, sanction_id, current_user, "处分记录不存在")
+    try:
+        sanction = await DisciplineService.close_sanction(db, sanction_id)
+        if not sanction:
+            raise HTTPException(status_code=404, detail="处分记录不存在")
+        return _format(sanction)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# ═══════════════════════════════════════════════════════════════
 # 违纪一键升级
 # ═══════════════════════════════════════════════════════════════
 
