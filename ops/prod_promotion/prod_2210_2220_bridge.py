@@ -137,29 +137,59 @@ def stage_apply_2210(ctx: PromotionContext) -> dict:
     return payload
 
 
-def stage_verify_2210(ctx: PromotionContext) -> dict:
+# ── 物理语义校验（verify 与 stamp 共用；stamp 在盖章前必须即时重跑）──
+def check_2210_physical(db) -> dict:
+    """2210 目标物理语义等价性：列存在 / BIGINT / nullable / FK / index / 无 unresolved。"""
     checks = {
-        "column_exists": ctx.db.column_exists("warning_feedback", "school_id"),
-        "type_bigint": "bigint"
-        in ctx.db.column_type("warning_feedback", "school_id").lower(),
-        "nullable": ctx.db.column_nullable("warning_feedback", "school_id"),
-        "fk": ctx.db.fk_exists("warning_feedback", "school_id", FK_NAME, "schools"),
-        "index": ctx.db.index_exists("warning_feedback", "school_id", IX_NAME),
-        "null_count": ctx.db.null_count("warning_feedback", "school_id"),
-        "row_count": ctx.db.row_count("warning_feedback"),
+        "column_exists": db.column_exists("warning_feedback", "school_id"),
+        "type_bigint": "bigint" in db.column_type("warning_feedback", "school_id").lower(),
+        "nullable": db.column_nullable("warning_feedback", "school_id"),
+        "fk": db.fk_exists("warning_feedback", "school_id", FK_NAME, "schools"),
+        "index": db.index_exists("warning_feedback", "school_id", IX_NAME),
+        "null_count": db.null_count("warning_feedback", "school_id"),
+        "row_count": db.row_count("warning_feedback"),
     }
+    checks["null_count_zero"] = checks["null_count"] == 0
     passed = (
         checks["column_exists"]
         and checks["type_bigint"]
         and checks["nullable"]
         and checks["fk"]
         and checks["index"]
-        and checks["null_count"] == 0
+        and checks["null_count_zero"]
     )
-    payload = {"checks": checks, "verified": passed, "stage": "verify_2210"}
+    return {"checks": checks, "passed": passed}
+
+
+def check_2220_physical(db, enum_before=None, dist_before=None) -> dict:
+    """2220 目标物理语义：status 为 ENUM 且 DEFAULT=PLANNING；给 before 则比对前后一致。"""
+    enum_now = db.column_type("ai_runs", "status")
+    dist_now = db.status_distribution("ai_runs", "status")
+    default_now = db.column_default("ai_runs", "status")
+    checks = {
+        "status_is_enum": "enum" in enum_now.lower(),
+        "default_planning": default_now == EXPECTED_DEFAULT,
+    }
+    if enum_before is not None:
+        checks["enum_unchanged"] = enum_now == enum_before
+    if dist_before is not None:
+        checks["dist_unchanged"] = [tuple(r) for r in dist_now] == [
+            tuple(r) for r in dist_before
+        ]
+    return {
+        "checks": checks,
+        "passed": all(checks.values()),
+        "default": default_now,
+        "enum": enum_now,
+    }
+
+
+def stage_verify_2210(ctx: PromotionContext) -> dict:
+    r = check_2210_physical(ctx.db)
+    payload = {"checks": r["checks"], "verified": r["passed"], "stage": "verify_2210"}
     ctx.evidence("verify_2210").write(payload)
-    if not passed:
-        raise ProdGuardError(f"verify-2210 FAIL: {checks}")
+    if not r["passed"]:
+        raise ProdGuardError(f"verify-2210 FAIL: {r['checks']}")
     return payload
 
 
@@ -169,14 +199,27 @@ def stage_stamp_2210(ctx: PromotionContext) -> dict:
     ev = ctx.evidence("verify_2210").read()
     if not ev or not ev.get("verified"):
         raise ProdGuardError(
-            "stamp-2210 DENY: 2210 物理语义未验证（verify-2210 evidence 缺失/未过）"
+            "stamp-2210 DENY: 审计链路不完整（verify-2210 evidence 缺失/未过）。"
+            "evidence 仅作审计记录，不得作为授权凭证。"
+        )
+    # ── 授权来自即时物理复核，不是 evidence ──
+    live = check_2210_physical(ctx.db)
+    if not live["passed"]:
+        raise ProdGuardError(
+            f"stamp-2210 DENY: 盖章前即时复核未通过（物理 schema 不等价）: {live['checks']}"
         )
     # stamp 仅恢复 alembic bookkeeping，不执行 DDL
     ctx.db.set_alembic_version(REV_2210)
     after = ctx.db.alembic_version()
     if after != REV_2210:
         raise ProdGuardError(f"stamp-2210 STOP: alembic_version={after} != {REV_2210}")
-    payload = {"stamped": REV_2210, "alembic_version": after, "stage": "stamp_2210"}
+    payload = {
+        "stamped": REV_2210,
+        "alembic_version": after,
+        "live_reverify": live["checks"],
+        "evidence_used_as": "AUDIT_ONLY",
+        "stage": "stamp_2210",
+    }
     ctx.evidence("stamp_2210").write(payload)
     return payload
 
@@ -221,28 +264,16 @@ def stage_verify_2220(ctx: PromotionContext) -> dict:
     ev = ctx.evidence("apply_2220").read()
     if not ev:
         raise ProdGuardError("verify-2220 FAIL: apply-2220 evidence 缺失")
-    enum_before = ev.get("enum_before")
-    dist_before = ev.get("dist_before") or []
-    enum_after = ctx.db.column_type("ai_runs", "status")
-    dist_after = ctx.db.status_distribution("ai_runs", "status")
-    default_after = ctx.db.column_default("ai_runs", "status")
-
-    checks = {
-        "enum_unchanged": enum_after == enum_before,
-        "dist_unchanged": [tuple(r) for r in dist_after]
-        == [tuple(r) for r in dist_before],
-        "default_planning": default_after == EXPECTED_DEFAULT,
-    }
-    passed = all(checks.values())
+    r = check_2220_physical(ctx.db, ev.get("enum_before"), ev.get("dist_before"))
     payload = {
-        "checks": checks,
-        "default": default_after,
-        "verified": passed,
+        "checks": r["checks"],
+        "default": r["default"],
+        "verified": r["passed"],
         "stage": "verify_2220",
     }
     ctx.evidence("verify_2220").write(payload)
-    if not passed:
-        raise ProdGuardError(f"verify-2220 FAIL: {checks}")
+    if not r["passed"]:
+        raise ProdGuardError(f"verify-2220 FAIL: {r['checks']}")
     return payload
 
 
@@ -252,13 +283,29 @@ def stage_stamp_2220(ctx: PromotionContext) -> dict:
     ev = ctx.evidence("verify_2220").read()
     if not ev or not ev.get("verified"):
         raise ProdGuardError(
-            "stamp-2220 DENY: 2220 物理语义未验证（verify-2220 evidence 缺失/未过）"
+            "stamp-2220 DENY: 审计链路不完整（verify-2220 evidence 缺失/未过）。"
+            "evidence 仅作审计记录，不得作为授权凭证。"
+        )
+    # ── 授权来自即时物理复核，不是 evidence ──
+    ev_apply = ctx.evidence("apply_2220").read() or {}
+    live = check_2220_physical(
+        ctx.db, ev_apply.get("enum_before"), ev_apply.get("dist_before")
+    )
+    if not live["passed"]:
+        raise ProdGuardError(
+            f"stamp-2220 DENY: 盖章前即时复核未通过（物理语义不符）: {live['checks']}"
         )
     ctx.db.set_alembic_version(REV_2220)
     after = ctx.db.alembic_version()
     if after != REV_2220:
         raise ProdGuardError(f"stamp-2220 STOP: alembic_version={after} != {REV_2220}")
-    payload = {"stamped": REV_2220, "alembic_version": after, "stage": "stamp_2220"}
+    payload = {
+        "stamped": REV_2220,
+        "alembic_version": after,
+        "live_reverify": live["checks"],
+        "evidence_used_as": "AUDIT_ONLY",
+        "stage": "stamp_2220",
+    }
     ctx.evidence("stamp_2220").write(payload)
     return payload
 

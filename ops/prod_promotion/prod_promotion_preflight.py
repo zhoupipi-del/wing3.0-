@@ -205,14 +205,16 @@ def load_production_db() -> ProdDB:
         database=database,
         cursorclass=pymysql.cursors.DictCursor,
     )
-    return _MysqlProdBridge(conn)
+    # 端口显式由 DSN 解析结果带入，绝不取 MySQL 自报的 server-internal 端口
+    return _MysqlProdBridge(conn, dsn_port=port)
 
 
 class _MysqlProdBridge:
     """生产真实连接适配（实现 ProdDB）。LOCAL candidate 轮不实例化。"""
 
-    def __init__(self, conn) -> None:
+    def __init__(self, conn, dsn_port: int) -> None:
         self._conn = conn
+        self._dsn_port = int(dsn_port)
 
     # ── 身份 / 版本 ──
     def database_name(self) -> str:
@@ -221,7 +223,13 @@ class _MysqlProdBridge:
             return cur.fetchone()["DATABASE()"]
 
     def connect_port(self) -> int:
-        return int(self._conn.port)
+        """宿主映射端口，来自 DSN（urlparse(DATABASE_URL).port）。
+
+        ⚠ 刻意不采用 MySQL 自报的 server-internal 端口：容器化部署中该值恒为容器
+        内部端口（如 3307→3306/tcp 映射时恒为 3306），无法区分 3307(生产) 与
+        3308(staging)，会导致 guard 误判。2026-09-07 BREAK-GLASS 已在 staging 侧踩过。
+        """
+        return self._dsn_port
 
     def current_user(self) -> str:
         with self._conn.cursor() as cur:

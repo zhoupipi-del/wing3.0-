@@ -53,9 +53,17 @@ from secret_redactor import redact_url, redact, redact_text  # noqa: E402
 class FakeDB:
     """内存态 ProdDB 实现，供自测驱动 6 阶段状态机。"""
 
-    def __init__(self, db_name="wings3", port=3307, user="grade7", alembic=HEAD_CF04OPS):
+    def __init__(
+        self,
+        db_name="wings3",
+        port=3307,
+        user="grade7",
+        alembic=HEAD_CF04OPS,
+        server_internal_port=3306,
+    ):
         self._db = db_name
-        self._port = port
+        self._port = port  # DSN / 宿主映射端口（guard 判定用）
+        self.server_internal_port = server_internal_port  # 模拟 SELECT @@port（容器内部端口）
         self._user = user
         self._alembic = alembic
         self.tables: dict = {}
@@ -81,6 +89,7 @@ class FakeDB:
         return self._db
 
     def connect_port(self):
+        # DSN 派生的宿主端口；刻意不返回 server_internal_port（@@port）
         return self._port
 
     def current_user(self):
@@ -499,3 +508,91 @@ def test_redact_text_masks_inline_secret():
     assert "topsecret" not in out
     assert "abc" not in out
     assert "***REDACTED***" in out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SHA-REVIEW 专项 1：guard 端口必须来自 DSN，不能是 MySQL @@port
+# （容器化部署中 MySQL 自报的是容器内部端口，3307→3306 映射时恒为 3306，
+#   据此判定会把生产/staging 混判 → guard 误杀。2026-09-07 BREAK-GLASS 已踩过。）
+# ═══════════════════════════════════════════════════════════════════════════
+def test_guard_uses_dsn_port_not_server_internal_port(tmp_path):
+    """DSN port=3307 应放行，即便 MySQL 自报 @@port=3306。"""
+    db = FakeDB(port=3307, server_internal_port=3306)
+    ctx = make_ctx(db, tmp_path)
+    g = require_prod_guard(ctx)
+    assert g["port"] == 3307  # 用的是 DSN 宿主端口
+    assert db.server_internal_port == 3306  # @@port 存在但未被采信
+
+
+def test_guard_dsn_3308_fail_even_if_server_port_3306(tmp_path):
+    """DSN 指向 staging 3308 → 必须 FAIL，即便 @@port 自报 3306。"""
+    db = FakeDB(port=3308, server_internal_port=3306)
+    ctx = make_ctx(db, tmp_path)
+    with pytest.raises(ProdGuardError):
+        require_prod_guard(ctx)
+
+
+def test_source_never_queries_server_internal_port():
+    """源码级钉死：guard 相关模块不得用 SELECT @@port 判定端口。"""
+    for name in (
+        "prod_promotion_preflight.py",
+        "prod_2210_2220_bridge.py",
+        "prod_promotion_postflight.py",
+    ):
+        src = (ROOT / "ops" / "prod_promotion" / name).read_text(encoding="utf-8")
+        assert "@@port" not in src, f"{name} 不得使用 SELECT @@port 判定端口"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SHA-REVIEW 专项 2：stamp 必须即时 re-verify，evidence 只是审计记录
+# （evidence 被旧文件/错误状态/误写污染时，仍可能盖章 → 必须在盖章前重读 DB）
+# ═══════════════════════════════════════════════════════════════════════════
+def test_stamp_2210_live_reverify_rejects_drift(tmp_path):
+    """evidence 齐全且 VERIFIED，但盖章前物理已漂移 → 拒绝且不动 alembic_version。"""
+    db = FakeDB()
+    _base_tables(db)
+    ctx = make_ctx(db, tmp_path)
+    stage_apply_2210(ctx)
+    stage_verify_2210(ctx)
+    assert ctx.evidence("verify_2210").read()["verified"] is True
+    # 漂移：FK 被删（模拟有人在 verify 之后动过库）
+    db.tables["warning_feedback"]["fk"].pop("school_id", None)
+    with pytest.raises(ProdGuardError, match="即时复核"):
+        stage_stamp_2210(ctx)
+    assert db.alembic_version() == HEAD_CF04OPS  # 未盖章
+
+
+def test_stamp_2210_stamps_only_after_live_reverify(tmp_path):
+    db = FakeDB()
+    _base_tables(db)
+    ctx = make_ctx(db, tmp_path)
+    stage_apply_2210(ctx)
+    stage_verify_2210(ctx)
+    r = stage_stamp_2210(ctx)
+    assert r["evidence_used_as"] == "AUDIT_ONLY"
+    assert r["live_reverify"]["fk"] is True
+    assert db.alembic_version() == REV_2210
+
+
+def test_stamp_2220_live_reverify_rejects_drift(tmp_path):
+    db = _db_at_2210()
+    ctx = make_ctx(db, tmp_path)
+    stage_apply_2220(ctx)
+    stage_verify_2220(ctx)
+    assert ctx.evidence("verify_2220").read()["verified"] is True
+    # 漂移：DEFAULT 被改回 None
+    db.tables["ai_runs"]["cols"]["status"]["default"] = None
+    with pytest.raises(ProdGuardError, match="即时复核"):
+        stage_stamp_2220(ctx)
+    assert db.alembic_version() == HEAD_2210  # 未盖章
+
+
+def test_stamp_2220_stamps_only_after_live_reverify(tmp_path):
+    db = _db_at_2210()
+    ctx = make_ctx(db, tmp_path)
+    stage_apply_2220(ctx)
+    stage_verify_2220(ctx)
+    r = stage_stamp_2220(ctx)
+    assert r["evidence_used_as"] == "AUDIT_ONLY"
+    assert r["live_reverify"]["default_planning"] is True
+    assert db.alembic_version() == REV_2220
